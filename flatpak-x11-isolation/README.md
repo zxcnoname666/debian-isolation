@@ -30,7 +30,7 @@ sudo grep -R --line-number --color=always "Exec=.*\/usr\/bin\/flatpak" /var/lib/
 ### Сделать замену прямо в `.desktop` файлах (только в строках `Exec=`):
 ```sh
 sudo find -L /var/lib/flatpak/exports/share/applications \
-  -name '*.desktop' -exec sed -i -E '/^Exec=/ s|/usr/bin/flatpak|$HOME/bin/flatpak-xephyr|g' {} +
+  -name '*.desktop' -exec sed -i -E "/^Exec=/ s|/usr/bin/flatpak|$HOME/bin/flatpak-xephyr|g" {} +
 ```
 ### Проверить результат:
 ```sh
