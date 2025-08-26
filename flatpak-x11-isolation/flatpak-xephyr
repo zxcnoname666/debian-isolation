@@ -639,7 +639,7 @@ monitor_and_resize() {
         
         # Получаем текущий размер окна
         local current_size=$(get_window_preferred_size "$window_id")
-        
+
         # Если размер изменился
         if [[ "$current_size" != "$last_size" ]]; then
             log_debug "Изменение размера: $last_size -> $current_size"
