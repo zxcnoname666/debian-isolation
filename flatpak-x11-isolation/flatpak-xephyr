@@ -689,23 +689,40 @@ EOSCRIPT
     
     log_message INFO "Запуск $app_id в динамическом Xephyr на дисплее $xephyr_display"
     
-    # Запускаем Xephyr с поддержкой изменения размера
+# Попытка автоопределения, можно задавать вручную перед вызовом wrapper'а
+XCURSOR_THEME="${XCURSOR_THEME:-}"
+# попытка получить из gsettings (если установлен и используете gnome-like)
+if [[ -z "$XCURSOR_THEME" ]] && command -v gsettings &>/dev/null; then
+  XCURSOR_THEME="$(gsettings get org.gnome.desktop.interface cursor-theme 2>/dev/null | tr -d \"\'\" )"
+fi
+
+if [ "$XCURSOR_THEME" = "Adwaita" ]; then
+    XCURSOR_THEME="cutefish-dark"
+fi
+
+# fallback
+export XCURSOR_THEME="${XCURSOR_THEME:-cutefish-dark}"
+export XCURSOR_SIZE="${XCURSOR_SIZE:-24}"
+export XCURSOR_PATH="${XCURSOR_PATH:-/usr/share/icons:$HOME/.icons:$HOME/.local/share/icons}"
+
     Xephyr "$xephyr_display" \
-        -screen "$initial_res" \
-        -resizeable \
-        -title "${app_id} (Dynamic)" \
-        -ac \
-        -br \
-        -noreset \
-        +extension GLX \
-        +extension DRI3 \
-        +extension RANDR \
-        +extension RENDER \
-        -terminate \
-        2>>"$LOG_FILE" &
-    
+      -screen "$initial_res" \
+      -resizeable \
+      -title "${app_id} (Dynamic)" \
+      -ac \
+      -br \
+      -noreset \
+      +extension GLX \
+      +extension DRI3 \
+      +extension RANDR \
+      +extension RENDER \
+      -glamor \
+      -terminate \
+      2>>"$LOG_FILE" &
+
     local xephyr_pid=$!
-    
+
+
     # Ждем запуска Xephyr
     local wait_count=0
     while [[ ! -e "/tmp/.X11-unix/X${display_num}" ]] && ((wait_count < 30)); do
@@ -759,8 +776,29 @@ EOSCRIPT
         log_message DEBUG "Запущен монитор размера (PID: $resize_monitor_pid)"
     fi
     
+# После запуска Xephyr и перед запуском приложения
+# Устанавливаем X ресурсы
+cat << EOF | DISPLAY="$xephyr_display" xrdb -merge
+Xcursor.theme: $XCURSOR_THEME
+Xcursor.size: $XCURSOR_SIZE
+Xcursor.theme_core: true
+EOF
+
+# Копируем тему курсоров если нужно
+if [[ -d "/usr/share/icons/$XCURSOR_THEME" ]]; then
+    DISPLAY="$xephyr_display" xsetroot -cursor_name left_ptr 2>/dev/null || true
+fi
+
     # Запускаем приложение
-    DISPLAY="$xephyr_display" "$REAL_FLATPAK" run "${all_args[@]}"
+DISPLAY="$xephyr_display" "$REAL_FLATPAK" run \
+  --env=XCURSOR_THEME="$XCURSOR_THEME" \
+  --env=XCURSOR_SIZE="$XCURSOR_SIZE" \
+  --env=GTK_USE_PORTAL=0 \
+  --env=QT_QPA_PLATFORMTHEME=gtk \
+  "${all_args[@]}"
+
+
+
     local app_exit_code=$?
     
     # Очистка
