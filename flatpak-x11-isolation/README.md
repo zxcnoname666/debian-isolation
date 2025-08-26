@@ -3,7 +3,7 @@
 sudo apt install xserver-xephyr openbox xdotool wmctrl x11-xserver-utils
 ```
 
-# Есть 2 вариант установки:
+# Есть 2 варианта установки:
 ## Первый
 Перезапись /usr/bin/flatpak
 1. Переносите /usr/bin/flatpak в /usr/bin/flatpak.orig
