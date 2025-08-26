@@ -1,6 +1,6 @@
 # Для работы необходимо установить следующие пакеты:
 ```sh
-sudo apt install xserver-xephyr openbox xdotool wmctrl x11-xserver-utils
+sudo apt install xserver-xephyr openbox xdotool wmctrl x11-xserver-utils xbindkeys
 ```
 
 # Есть 2 варианта установки:
