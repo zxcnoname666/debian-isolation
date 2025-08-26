@@ -157,7 +157,6 @@ parse_flatpak_run_args() {
 }
 
 # ====== ФУНКЦИИ XEPHYR ======
-
 init_config() {
     if [[ ! -d "$CONFIG_DIR" ]]; then
         mkdir -p "$CONFIG_DIR"
@@ -414,7 +413,7 @@ save_size_to_config() {
 
 # Попытка найти host window (Xephyr) на хосте
 find_host_xephyr_window() {
-    local title="${APP_ID} (Dynamic)"
+    local title="${APP_ID}"
     # пробуем прямой поиск по заголовку
     local hw
     hw=$(DISPLAY="$HOST_DISPLAY" xdotool search --name "$title" 2>/dev/null | head -n1 || true)
@@ -749,10 +748,10 @@ resize_xephyr_display() {
     fi
 
     if command -v xdotool &>/dev/null; then
-        # найти окно Xephyr на хосте по заголовку (в основном скрипте вы ставите -title "${app_id} (Dynamic)")
+        # найти окно Xephyr на хосте по заголовку (в основном скрипте вы ставите -title "${app_id}")
         local host_win
         # используем HOST_DISPLAY, чтобы xdotool обращался к хостовому X
-        host_win=$(DISPLAY="$host_display" xdotool search --name "${app_id} (Dynamic)" 2>/dev/null | head -n1)
+        host_win=$(DISPLAY="$host_display" xdotool search --name "${app_id}" 2>/dev/null | head -n1)
         if [[ -n "$host_win" ]]; then
             DISPLAY="$host_display" xdotool windowsize "$host_win" "$width" "$height" 2>/dev/null || true
             # небольшая пауза, затем убедиться, что xrandr внутри Xephyr обновился (опционально)
@@ -936,7 +935,8 @@ export XCURSOR_PATH="${XCURSOR_PATH:-/usr/share/icons:$HOME/.icons:$HOME/.local/
     Xephyr "$xephyr_display" \
       -screen "$initial_res" \
       -resizeable \
-      -title "${app_id} (Dynamic)" \
+      -title "${app_id}" \
+      -name "${app_id}" \
       -ac \
       -br \
       -noreset \
@@ -963,6 +963,7 @@ export XCURSOR_PATH="${XCURSOR_PATH:-/usr/share/icons:$HOME/.icons:$HOME/.local/
         rm -rf "$temp_dir"
         exec "$REAL_FLATPAK" run "$@"
     fi
+
     
     # Функция очистки
     cleanup() {
