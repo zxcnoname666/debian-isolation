@@ -278,7 +278,6 @@ load_window_size() {
 }
 
 # ====== ДИНАМИЧЕСКАЯ ВЕРСИЯ run_in_xephyr (замена оригинальной) ======
-
 run_in_xephyr() {
     # Улучшенная функция run_in_xephyr с динамическим размером
     local all_args=("$@")
@@ -964,10 +963,91 @@ export XCURSOR_PATH="${XCURSOR_PATH:-/usr/share/icons:$HOME/.icons:$HOME/.local/
         exec "$REAL_FLATPAK" run "$@"
     fi
 
+    # Запускаем перехват клавиш переключения раскладки
+    cat > "$temp_dir/keyboard-sync.sh" << EOSCRIPT
+#!/bin/bash
+XEPHYR_DISPLAY="$xephyr_display"
+HOST_DISPLAY="${DISPLAY:-:0}"
+APP_ID="$app_id"
+
+
+# Функция проверки фокуса окна Xephyr
+is_xephyr_focused() {
+    # Получаем ID активного окна
+    local active_window=\$(DISPLAY="\$HOST_DISPLAY" xdotool getactivewindow 2>/dev/null)
+    
+    if [[ -z "\$active_window" ]]; then
+        return 1
+    fi
+    
+    # Получаем класс активного окна
+    local window_class=\$(DISPLAY="\$HOST_DISPLAY" xprop -id "\$active_window" WM_CLASS 2>/dev/null)
+    
+    # Проверяем, является ли это окном Xephyr с нашим app_id
+    if [[ "\$window_class" == *"Xephyr"* ]] || [[ "\$window_class" == *"\$APP_ID"* ]]; then
+        return 0
+    fi
+    
+    # Альтернативная проверка по заголовку
+    local window_title=\$(DISPLAY="\$HOST_DISPLAY" xdotool getwindowname "\$active_window" 2>/dev/null)
+    if [[ "\$window_title" == *"\$APP_ID"* ]]; then
+        return 0
+    fi
+    
+    return 1
+}
+
+# Быстрая синхронизация при изменении
+last_led=""
+was_focused=false
+
+while true; do
+    # Проверяем фокус
+    if is_xephyr_focused; then
+        # текущая раскладка
+        current_led=\$(DISPLAY="\$HOST_DISPLAY" setxkbmap -query 2>/dev/null | grep "layout:" | awk '{print \$2}')
+        
+        if [[ "\$was_focused" == "false" ]]; then
+            # Окно получило фокус - синхронизируем немедленно
+            was_focused=true
+            
+            DISPLAY="\$XEPHYR_DISPLAY" setxkbmap \${current_led%%$'\n'*} 2>/dev/null || true
+            last_led="\$current_led"
+        fi
+        
+        # Окно в фокусе - проверяем изменения
+        if [[ "\$current_led" != "\$last_led" ]]; then
+            DISPLAY="\$XEPHYR_DISPLAY" setxkbmap \${current_led%%$'\n'*} 2>/dev/null || true
+            last_led="\$current_led"
+        fi
+        
+        # Быстрая проверка когда в фокусе
+        sleep 0.01
+    else
+        # Окно не в фокусе
+        was_focused=false
+        # Медленная проверка когда не в фокусе
+        sleep 1
+    fi
+done
+
+EOSCRIPT
+    
+    chmod +x "$temp_dir/keyboard-sync.sh"
+
+    "$temp_dir/keyboard-sync.sh" &
+    keyboard_sync_pid=$!
+    log_message DEBUG "Запущена синхронизация клавиатуры (PID: $keyboard_sync_pid)"
+
     
     # Функция очистки
     cleanup() {
         log_message DEBUG "Очистка процессов и файлов"
+    
+    # Завершаем перехват клавиш
+    if [[ -n "${keyboard_sync_pid:-}" ]]; then
+        kill "$keyboard_sync_pid" 2>/dev/null || true
+    fi
         
         # Завершаем монитор размера
         if [[ -n "${resize_monitor_pid:-}" ]]; then
