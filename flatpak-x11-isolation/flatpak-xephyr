@@ -1,1 +1,1052 @@
+#!/bin/bash
+# Скрипт-обертка для flatpak с автоматическим запуском через Xephyr
+# Сохранить как: ~/bin/flatpak или /usr/local/bin/flatpak
 
+# ====== КОНФИГУРАЦИЯ ======
+
+# Путь к оригинальному flatpak (будет найден автоматически)
+REAL_FLATPAK=""
+
+# Настройки Xephyr
+XEPHYR_RESOLUTION="${FLATPAK_XEPHYR_RES:-1280x720}"
+XEPHYR_ENABLED="${FLATPAK_XEPHYR:-true}"
+CONFIG_DIR="$HOME/.config/flatpak-xephyr"
+EXCLUDE_FILE="$CONFIG_DIR/exclude.conf"
+LOG_FILE="$CONFIG_DIR/xephyr.log"
+
+# Встроенные исключения
+DEFAULT_EXCLUDES=(
+    "org.kde.kdenlive"
+    "com.obsproject.Studio"
+    "org.blender.Blender"
+    "org.gimp.GIMP"
+    "com.unity.UnityHub"
+    "org.inkscape.Inkscape"
+)
+
+# Цвета для вывода
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# ====== ФУНКЦИИ ПОИСКА ОРИГИНАЛЬНОГО FLATPAK ======
+
+find_real_flatpak() {
+    local current_script="$(readlink -f "$0")"
+    local possible_paths=(
+        "/usr/bin/flatpak"
+        "/bin/flatpak"
+        "/usr/local/bin/flatpak.orig"
+        "/usr/bin/flatpak.orig"
+        "$(which -a flatpak 2>/dev/null | grep -v "$current_script" | head -1)"
+    )
+    
+    for path in "${possible_paths[@]}"; do
+        if [[ -x "$path" ]] && [[ "$path" != "$current_script" ]]; then
+            echo "$path"
+            return 0
+        fi
+    done
+    
+    # Если не нашли, ищем через PATH
+    local IFS=:
+    for dir in $PATH; do
+        local flatpak_path="$dir/flatpak"
+        if [[ -x "$flatpak_path" ]] && [[ "$flatpak_path" != "$current_script" ]]; then
+            if [[ "$flatpak_path" != "$(readlink -f "$flatpak_path")" ]]; then
+                flatpak_path="$(readlink -f "$flatpak_path")"
+            fi
+            if [[ "$flatpak_path" != "$current_script" ]]; then
+                echo "$flatpak_path"
+                return 0
+            fi
+        fi
+    done
+    
+    return 1
+}
+
+# ====== ФУНКЦИИ ПАРСИНГА АРГУМЕНТОВ ======
+
+parse_flatpak_run_args() {
+    # Эта функция парсит аргументы flatpak run и извлекает APP_ID
+    # Возвращает APP_ID через глобальную переменную PARSED_APP_ID
+    # Все аргументы остаются в массиве FLATPAK_RUN_ARGS
+    
+    local args=("$@")
+    local i=0
+    local skip_next=false
+    
+    PARSED_APP_ID=""
+    FLATPAK_RUN_ARGS=("$@")
+    
+    # Опции, которые требуют значения после себя
+    local options_with_value=(
+        "--arch"
+        "--branch"
+        "--command"
+        "--cwd"
+        "--runtime"
+        "--runtime-version"
+        "--socket"
+        "--nosocket"
+        "--device"
+        "--nodevice"
+        "--allow"
+        "--disallow"
+        "--filesystem"
+        "--nofilesystem"
+        "--env"
+        "--env-fd"
+        "--unset-env"
+        "--own-name"
+        "--talk-name"
+        "--no-talk-name"
+        "--system-own-name"
+        "--system-talk-name"
+        "--system-no-talk-name"
+        "--add-policy"
+        "--remove-policy"
+        "--persist"
+        "--session-bus"
+        "--system-bus"
+        "--log-session"
+        "--log-system"
+        "--installation"
+    )
+    
+    while [[ $i -lt ${#args[@]} ]]; do
+        local arg="${args[$i]}"
+        
+        # Пропускаем, если это значение предыдущей опции
+        if [[ "$skip_next" == true ]]; then
+            skip_next=false
+            ((i++))
+            continue
+        fi
+        
+        # Проверяем, является ли это опцией
+        if [[ "$arg" == --* ]]; then
+            # Проверяем, требует ли эта опция значение
+            for opt in "${options_with_value[@]}"; do
+                if [[ "$arg" == "$opt" ]] || [[ "$arg" == "$opt="* ]]; then
+                    if [[ "$arg" == *"="* ]]; then
+                        # Значение включено в опцию (--opt=value)
+                        skip_next=false
+                    else
+                        # Следующий аргумент - значение этой опции
+                        skip_next=true
+                    fi
+                    break
+                fi
+            done
+        elif [[ "$arg" == -* ]]; then
+            # Короткие опции — ничего не делаем
+            :
+        elif [[ "$arg" != "" ]]; then
+            # Это не опция и не пустая строка - это APP_ID
+            PARSED_APP_ID="$arg"
+            break
+        fi
+        
+        ((i++))
+    done
+}
+
+# ====== ФУНКЦИИ XEPHYR ======
+
+init_config() {
+    if [[ ! -d "$CONFIG_DIR" ]]; then
+        mkdir -p "$CONFIG_DIR"
+        
+        # Создаем файл исключений с комментариями
+        cat > "$EXCLUDE_FILE" << 'EOF'
+# Файл исключений для flatpak-xephyr
+# Одно приложение на строку
+# Строки начинающиеся с # игнорируются
+#
+# Примеры:
+# org.mozilla.firefox
+# com.spotify.Client
+EOF
+        
+        # Добавляем исключения по умолчанию
+        for app in "${DEFAULT_EXCLUDES[@]}"; do
+            echo "$app" >> "$EXCLUDE_FILE"
+        done
+    fi
+}
+
+is_excluded() {
+    local app_id="$1"
+    
+    # Проверка встроенного списка
+    for excluded in "${DEFAULT_EXCLUDES[@]}"; do
+        [[ "$app_id" == "$excluded" ]] && return 0
+    done
+    
+    # Проверка пользовательского файла
+    if [[ -f "$EXCLUDE_FILE" ]]; then
+        grep -q "^${app_id}$" "$EXCLUDE_FILE" 2>/dev/null && return 0
+    fi
+    
+    return 1
+}
+
+find_free_display() {
+    local display=99
+    while [[ -e "/tmp/.X11-unix/X${display}" ]]; do
+        ((display++))
+    done
+    echo "$display"
+}
+
+log_message() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+    
+    # Создаем директорию логов, если нужно
+    mkdir -p "$(dirname "$LOG_FILE")"
+    echo "[${timestamp}] [${level}] ${message}" >> "$LOG_FILE"
+    
+    case "$level" in
+        ERROR)   echo -e "${RED}✗ ${message}${NC}" >&2 ;;
+        WARNING) echo -e "${YELLOW}⚠ ${message}${NC}" >&2 ;;
+        INFO)    echo -e "${GREEN}✓ ${message}${NC}" ;;
+        DEBUG)   [[ "${DEBUG:-0}" == "1" ]] && echo -e "${BLUE}• ${message}${NC}" ;;
+    esac
+}
+
+check_xephyr() {
+    if ! command -v Xephyr &>/dev/null; then
+        log_message WARNING "Xephyr не установлен"
+        echo -e "${YELLOW}Для установки выполните:${NC}"
+        echo "  Ubuntu/Debian: sudo apt install xserver-xephyr"
+        echo "  Fedora: sudo dnf install xorg-x11-server-Xephyr"
+        echo "  Arch: sudo pacman -S xorg-server-xephyr"
+        return 1
+    fi
+    return 0
+}
+
+# ====== ДИНАМИЧЕСКАЯ ВЕРСИЯ run_in_xephyr (замена оригинальной) ======
+
+run_in_xephyr() {
+    # Улучшенная функция run_in_xephyr с динамическим размером
+    local all_args=("$@")
+    
+    # Парсим аргументы для получения APP_ID
+    parse_flatpak_run_args "$@"
+    local app_id="$PARSED_APP_ID"
+    
+    if [[ -z "$app_id" ]]; then
+        log_message WARNING "Не удалось определить APP_ID из аргументов"
+        exec "$REAL_FLATPAK" run "$@"
+    fi
+    
+    # Проверяем зависимости (включая Xephyr)
+    local missing_deps=()
+    for cmd in Xephyr openbox xdotool wmctrl xrandr; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing_deps+=("$cmd")
+        fi
+    done
+    
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        log_message WARNING "Отсутствуют зависимости: ${missing_deps[*]}"
+        echo -e "${YELLOW}Для динамического размера установите:${NC}"
+        echo "  sudo apt install xserver-xephyr openbox xdotool wmctrl x11-xserver-utils"
+        exec "$REAL_FLATPAK" run "$@"
+    fi
+    
+    # Настройки
+    local display_num=$(find_free_display)
+    local xephyr_display=":${display_num}"
+    local initial_res="${XEPHYR_RESOLUTION:-1280x720}"
+    local dynamic_resize="${XEPHYR_DYNAMIC:-true}"
+    
+    # Временные файлы
+    local temp_dir="/tmp/xephyr-${display_num}-$$"
+    mkdir -p "$temp_dir"
+    local openbox_config="$temp_dir/openbox-rc.xml"
+    local resize_script="$temp_dir/resize-monitor.sh"
+    local window_manager_pid_file="$temp_dir/wm.pid"
+    
+    # Создаем минимальный конфиг для Openbox
+    cat > "$openbox_config" << 'EOCONFIG'
+<?xml version="1.0" encoding="UTF-8"?>
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <resistance>
+    <strength>0</strength>
+    <screen_edge_strength>0</screen_edge_strength>
+  </resistance>
+  <focus>
+    <focusNew>yes</focusNew>
+    <followMouse>no</followMouse>
+  </focus>
+  <placement>
+    <policy>Smart</policy>
+    <center>yes</center>
+  </placement>
+  <theme>
+    <name>Clearlooks</name>
+    <titleLayout>NLIMC</titleLayout>
+    <keepBorder>no</keepBorder>
+    <hideDisabled>yes</hideDisabled>
+  </theme>
+  <desktops>
+    <number>1</number>
+    <firstdesk>1</firstdesk>
+  </desktops>
+  <resize>
+    <drawContents>yes</drawContents>
+    <popupShow>Always</popupShow>
+  </resize>
+  <applications>
+    <application class="*">
+      <maximized>no</maximized>
+      <decor>yes</decor>
+      <fullscreen>no</fullscreen>
+    </application>
+  </applications>
+</openbox_config>
+EOCONFIG
+
+    # Создаем скрипт для мониторинга и изменения размера
+    cat > "$resize_script" << 'EOSCRIPT'
+#!/bin/bash
+
+DISPLAY="$1"
+APP_ID="$2"
+XEPHYR_PID="$3"
+DEBUG="${4:-0}"
+
+# Функции логирования
+log_debug() {
+    [[ "$DEBUG" == "1" ]] && echo "[RESIZE] $*" >&2
+}
+
+# Ждем появления окна приложения
+
+# Попытка найти host window (Xephyr) на хосте
+find_host_xephyr_window() {
+    local title="${APP_ID} (Dynamic)"
+    # пробуем прямой поиск по заголовку
+    local hw
+    hw=$(DISPLAY="$HOST_DISPLAY" xdotool search --name "$title" 2>/dev/null | head -n1 || true)
+    if [[ -n "$hw" ]]; then
+        echo "$hw"
+        return 0
+    fi
+    # если не найдено — попробуем искать окна содержащие app id в заголовке/klass
+    hw=$(DISPLAY="$HOST_DISPLAY" xdotool search --name "$APP_ID" 2>/dev/null | head -n1 || true)
+    if [[ -n "$hw" ]]; then
+        echo "$hw"
+        return 0
+    fi
+    # последний шаг — поиск окна с классом/названием xephyr (если у вас несколько xephyr окон — может быть шум)
+    hw=$(DISPLAY="$HOST_DISPLAY" xdotool search --classname "Xephyr" 2>/dev/null | head -n1 || true)
+    if [[ -n "$hw" ]]; then
+        echo "$hw"
+        return 0
+    fi
+    # ничего не найдено
+    echo ""
+    return 1
+}
+
+# Ждём появление клиентского окна внутри Xephyr (функция из прошлых версий)
+wait_for_window() {
+    local timeout=30
+    local window_id=""
+
+    for ((i=0; i<timeout; i++)); do
+        # 1) Попробуем целевые поиски по APP_ID (class/name)
+        for cmd in "--class" "--classname" "--name"; do
+            window_id=$(DISPLAY="$DISPLAY" xdotool search --onlyvisible $cmd "$APP_ID" 2>/dev/null | head -n1 || true)
+            if [[ -n "$window_id" ]]; then
+                # фильтруем vhost окна (Xephyr/Openbox)
+                if is_vhost_window "$window_id"; then
+                    window_id=$(DISPLAY="$DISPLAY" xdotool search --onlyvisible $cmd "$APP_ID" 2>/dev/null | while read wid; do
+                        if ! is_vhost_window "$wid"; then
+                            echo "$wid"
+                            break
+                        fi
+                    done)
+                fi
+                if [[ -n "$window_id" ]]; then
+                    echo "$window_id"
+                    return 0
+                fi
+            fi
+        done
+
+        # 2) Скан всех видимых окон, выбираем первое "нормальное"
+        local all_wins
+        all_wins=$(DISPLAY="$DISPLAY" xdotool search --onlyvisible --all "" 2>/dev/null || true)
+        if [[ -n "$all_wins" ]]; then
+            while read -r wid; do
+                [[ -z "$wid" ]] && continue
+                if is_vhost_window "$wid"; then
+                    continue
+                fi
+                if DISPLAY="$DISPLAY" xwininfo -id "$wid" &>/dev/null; then
+                    echo "$wid"
+                    return 0
+                fi
+            done <<< "$all_wins"
+        fi
+
+        sleep 0.5
+    done
+
+    return 1
+}
+
+# Получаем предпочтительный размер внутреннего окна (как раньше)
+get_window_preferred_size() {
+    local window_id="$1"
+
+    # Попытка из WM_NORMAL_HINTS
+    local size_hints
+    size_hints=$(DISPLAY="$DISPLAY" xprop -id "$window_id" WM_NORMAL_HINTS 2>/dev/null || true)
+    local base_width base_height
+    base_width=$(echo "$size_hints" | grep -oP 'base_width:\s*\K\d+' || true)
+    base_height=$(echo "$size_hints" | grep -oP 'base_height:\s*\K\d+' || true)
+
+    if [[ -n "$base_width" && "$base_width" =~ ^[0-9]+$ ]] && [[ -n "$base_height" && "$base_height" =~ ^[0-9]+$ ]] && \
+       [[ "$base_width" -gt 0 && "$base_height" -gt 0 ]]; then
+        local padding_width=20
+        local padding_height=50
+        echo "$((base_width + padding_width))x$((base_height + padding_height))"
+        return 0
+    fi
+
+    # Если нет — используем xwininfo
+    local geometry
+    geometry=$(DISPLAY="$DISPLAY" xwininfo -id "$window_id" 2>/dev/null || true)
+    if [[ -n "$geometry" ]]; then
+        local w h
+        w=$(echo "$geometry" | awk '/Width:/ {print $2; exit}')
+        h=$(echo "$geometry" | awk '/Height:/ {print $2; exit}')
+        if [[ "$w" =~ ^[0-9]+$ ]] && [[ "$h" =~ ^[0-9]+$ ]]; then
+            local padding_width=20
+            local padding_height=50
+            echo "$((w + padding_width))x$((h + padding_height))"
+            return 0
+        fi
+    fi
+
+    # fallback — xdotool geometry
+    local geometry2
+    geometry2=$(DISPLAY="$DISPLAY" xdotool getwindowgeometry "$window_id" 2>/dev/null || true)
+    if [[ -n "$geometry2" ]]; then
+        local gw gh
+        gw=$(echo "$geometry2" | grep -oP 'Geometry:\s*\K[0-9]+' || true)
+        gh=$(echo "$geometry2" | grep -oP 'Geometry:\s*[0-9]+x\K[0-9]+' || true)
+        if [[ -n "$gw" && -n "$gh" ]]; then
+            local padding_width=20
+            local padding_height=50
+            echo "$((gw + padding_width))x$((gh + padding_height))"
+            return 0
+        fi
+    fi
+
+    echo ""
+    return 1
+}
+
+# Функция изменения размера внутреннего окна (внутри Xephyr)
+resize_inner_window_to_host() {
+    local host_w="$1"
+    local host_h="$2"
+    local win="$3"   # внутренний window id
+
+    # Отнимаем некоторые декорации/отступы, чтобы клиент поместился
+    local dec_w=10
+    local dec_h=40
+    local target_w=$(( host_w - dec_w ))
+    local target_h=$(( host_h - dec_h ))
+    [[ $target_w -lt 100 ]] && target_w=100
+    [[ $target_h -lt 50 ]] && target_h=50
+
+    log_debug "Resizing inner window $win to ${target_w}x${target_h} (host was ${host_w}x${host_h})"
+
+    # используем wmctrl/xdotool внутри Xephyr
+    if command -v wmctrl &>/dev/null; then
+        DISPLAY="$DISPLAY" wmctrl -i -r "$win" -e "0,0,0,${target_w},${target_h}" 2>/dev/null || true
+    fi
+    if command -v xdotool &>/dev/null; then
+        DISPLAY="$DISPLAY" xdotool windowsize "$win" "$target_w" "$target_h" 2>/dev/null || true
+    fi
+}
+
+# Основной монитор: отслеживаем изменения внутреннего окна и изменений размера хостового окна Xephyr
+monitor_and_resize() {
+    local window_id="$1"
+    local last_inner_size=""
+    local last_host_size=""
+    local check_interval=1
+
+    # найдём host window id на хосте (может появиться чуть позже) — будем обновлять при необходимости
+    local host_win
+    host_win=$(find_host_xephyr_window)
+    if [[ -z "$host_win" ]]; then
+        log_debug "Host Xephyr window not found on $HOST_DISPLAY - will retry in loop"
+    else
+        # получим начальный размер host
+        local host_geom
+        host_geom=$(DISPLAY="$HOST_DISPLAY" xwininfo -id "$host_win" 2>/dev/null || true)
+        if [[ -n "$host_geom" ]]; then
+            local hw hh
+            hw=$(echo "$host_geom" | awk '/Width:/ {print $2; exit}')
+            hh=$(echo "$host_geom" | awk '/Height:/ {print $2; exit}')
+            last_host_size="${hw}x${hh}"
+        fi
+    fi
+
+    log_debug "Start monitoring: inner_window=$window_id host_win=$host_win (HOST_DISPLAY=$HOST_DISPLAY)"
+
+    while kill -0 "$XEPHYR_PID" 2>/dev/null; do
+        # 1) Проверим внутреннее приложение
+        if ! DISPLAY="$DISPLAY" xdotool getwindowgeometry "$window_id" &>/dev/null; then
+            log_debug "Inner window $window_id disappeared"
+            break
+        fi
+
+        # получить текущий предпочтительный внутренний размер
+        local current_inner_size
+        current_inner_size=$(get_window_preferred_size "$window_id" || true)
+
+        # если внутренний размер сменился — изменим дисплей Xephyr под него (как раньше)
+        if [[ -n "$current_inner_size" && "$current_inner_size" != "$last_inner_size" ]]; then
+            log_debug "Inner size changed: $last_inner_size -> $current_inner_size"
+            # изменяем размер дисплея (функция должна быть доступна в родительском scope)
+            resize_xephyr_display "$current_inner_size" || true
+            last_inner_size="$current_inner_size"
+        fi
+
+        # 2) Проверим хостовое окно Xephyr (его геометрию)
+        if [[ -z "$host_win" ]]; then
+            host_win=$(find_host_xephyr_window) || true
+        fi
+
+        if [[ -n "$host_win" ]]; then
+            # получим ширину/высоту хост-окна
+            local host_geom2 hw2 hh2
+            host_geom2=$(DISPLAY="$HOST_DISPLAY" xwininfo -id "$host_win" 2>/dev/null || true)
+            if [[ -n "$host_geom2" ]]; then
+                hw2=$(echo "$host_geom2" | awk '/Width:/ {print $2; exit}')
+                hh2=$(echo "$host_geom2" | awk '/Height:/ {print $2; exit}')
+                if [[ -n "$hw2" && -n "$hh2" ]]; then
+                    local host_size_now="${hw2}x${hh2}"
+                    if [[ "$host_size_now" != "$last_host_size" ]]; then
+                        log_debug "Host Xephyr size changed: $last_host_size -> $host_size_now"
+                        # изменяем внутреннее окно под новый размер хоста
+                        resize_inner_window_to_host "$hw2" "$hh2" "$window_id"
+                        last_host_size="$host_size_now"
+                        # возможно, после изменения внутреннего окна нужно подправить размер дисплея — 
+                        # получить новый preferred size и применить
+                        local new_pref
+                        new_pref=$(get_window_preferred_size "$window_id" || true)
+                        if [[ -n "$new_pref" ]]; then
+                            resize_xephyr_display "$new_pref" || true
+                            last_inner_size="$new_pref"
+                        fi
+                    fi
+                fi
+            fi
+        fi
+
+        sleep "$check_interval"
+    done
+}
+
+# Изменяем размер дисплея Xephyr
+resize_xephyr_display() {
+    local new_size="$1"   # формат WxH
+    local xephyr_display="$DISPLAY"   # в скрипте DISPLAY уже установлен в :XX
+    local width=${new_size%x*}
+    local height=${new_size#*x}
+
+    # 1) Попытка простого xrandr --size
+    if DISPLAY="$xephyr_display" xrandr --size "$new_size" &>/dev/null; then
+        return 0
+    fi
+
+    # 2) Попытка определить имя вывода (first connected) и задать режим на него
+    local out
+    out=$(DISPLAY="$xephyr_display" xrandr --query 2>/dev/null | awk '/ connected/{print $1; exit}')
+    if [[ -n "$out" ]]; then
+        # попробовать напрямую выставить режим (если есть)
+        if DISPLAY="$xephyr_display" xrandr --output "$out" --mode "${width}x${height}" 2>/dev/null; then
+            return 0
+        fi
+
+        # добавить новый режим и применить
+        if command -v cvt &>/dev/null; then
+            local modeline
+            modeline=$(cvt "$width" "$height" 60 2>/dev/null | sed -n 's/Modeline //p')
+            local mode_name="${width}x${height}_60.00"
+            DISPLAY="$xephyr_display" xrandr --newmode $modeline 2>/dev/null || true
+            DISPLAY="$xephyr_display" xrandr --addmode "$out" "$mode_name" 2>/dev/null || true
+            DISPLAY="$xephyr_display" xrandr --output "$out" --mode "$mode_name" 2>/dev/null && return 0 || true
+        fi
+    fi
+
+    # 3) FALLBACK: изменить геометрию окна Xephyr на хосте (требует xdotool на хосте)
+    # Передаём HOST_DISPLAY в argv (см. ниже — как запускать скрипт)
+    local host_display="${HOST_DISPLAY:-$XDG_SESSION_DISPLAY}"  # попытка получить из env
+    if [[ -z "$host_display" ]]; then
+        host_display=":0"
+    fi
+
+    if command -v xdotool &>/dev/null; then
+        # найти окно Xephyr на хосте по заголовку (в основном скрипте вы ставите -title "${app_id} (Dynamic)")
+        local host_win
+        # используем HOST_DISPLAY, чтобы xdotool обращался к хостовому X
+        host_win=$(DISPLAY="$host_display" xdotool search --name "${app_id} (Dynamic)" 2>/dev/null | head -n1)
+        if [[ -n "$host_win" ]]; then
+            DISPLAY="$host_display" xdotool windowsize "$host_win" "$width" "$height" 2>/dev/null || true
+            # небольшая пауза, затем убедиться, что xrandr внутри Xephyr обновился (опционально)
+            sleep 0.15
+            return 0
+        fi
+    fi
+
+    # ничего не помогло
+    return 1
+}
+
+# Основной цикл мониторинга
+monitor_and_resize() {
+    local window_id="$1"
+    local last_size=""
+    local check_interval=2
+    
+    log_debug "Начинаем мониторинг окна $window_id"
+    
+    while kill -0 "$XEPHYR_PID" 2>/dev/null; do
+        # Проверяем, существует ли окно
+        if ! DISPLAY="$DISPLAY" xdotool getwindowgeometry "$window_id" &>/dev/null; then
+            log_debug "Окно $window_id больше не существует"
+            break
+        fi
+        
+        # Получаем текущий размер окна
+        local current_size=$(get_window_preferred_size "$window_id")
+        
+        # Если размер изменился
+        if [[ "$current_size" != "$last_size" ]]; then
+            log_debug "Изменение размера: $last_size -> $current_size"
+            
+            # Изменяем размер дисплея
+            resize_xephyr_display "$current_size"
+            
+            # Максимизируем окно после изменения размера
+            DISPLAY="$DISPLAY" wmctrl -i -r "$window_id" -b add,maximized_vert,maximized_horz 2>/dev/null || true
+            
+            last_size="$current_size"
+        fi
+        
+        sleep "$check_interval"
+    done
+}
+
+# === ГЛАВНЫЙ ПОТОК ===
+
+log_debug "Запуск монитора размера для $APP_ID на дисплее $DISPLAY"
+
+# Ждем появления окна
+window_id=$(wait_for_window)
+
+if [[ -z "$window_id" ]]; then
+    log_debug "Окно приложения не найдено в течение таймаута"
+    exit 1
+fi
+
+log_debug "Найдено окно: $window_id"
+
+# Начальная настройка размера
+initial_size=$(get_window_preferred_size "$window_id")
+log_debug "Начальный размер: $initial_size"
+
+# Устанавливаем начальный размер
+resize_xephyr_display "$initial_size"
+
+# Максимизируем окно
+DISPLAY="$DISPLAY" wmctrl -i -r "$window_id" -b add,maximized_vert,maximized_horz 2>/dev/null || true
+
+# Запускаем мониторинг
+monitor_and_resize "$window_id"
+EOSCRIPT
+
+    chmod +x "$resize_script"
+    
+    log_message INFO "Запуск $app_id в динамическом Xephyr на дисплее $xephyr_display"
+    
+    # Запускаем Xephyr с поддержкой изменения размера
+    Xephyr "$xephyr_display" \
+        -screen "$initial_res" \
+        -resizeable \
+        -title "${app_id} (Dynamic)" \
+        -ac \
+        -br \
+        -noreset \
+        +extension GLX \
+        +extension DRI3 \
+        +extension RANDR \
+        +extension RENDER \
+        -terminate \
+        2>>"$LOG_FILE" &
+    
+    local xephyr_pid=$!
+    
+    # Ждем запуска Xephyr
+    local wait_count=0
+    while [[ ! -e "/tmp/.X11-unix/X${display_num}" ]] && ((wait_count < 30)); do
+        sleep 0.1
+        ((wait_count++))
+    done
+    
+    if ! kill -0 "$xephyr_pid" 2>/dev/null; then
+        log_message ERROR "Xephyr не запустился"
+        rm -rf "$temp_dir"
+        exec "$REAL_FLATPAK" run "$@"
+    fi
+    
+    # Функция очистки
+    cleanup() {
+        log_message DEBUG "Очистка процессов и файлов"
+        
+        # Завершаем монитор размера
+        if [[ -n "${resize_monitor_pid:-}" ]]; then
+            kill "$resize_monitor_pid" 2>/dev/null || true
+        fi
+        
+        # Завершаем оконный менеджер
+        if [[ -f "$window_manager_pid_file" ]]; then
+            local wm_pid=$(cat "$window_manager_pid_file")
+            kill "$wm_pid" 2>/dev/null || true
+        fi
+        
+        # Завершаем Xephyr
+        if [[ -n "$xephyr_pid" ]]; then
+            kill "$xephyr_pid" 2>/dev/null || true
+            wait "$xephyr_pid" 2>/dev/null || true
+        fi
+        
+        # Удаляем временные файлы
+        rm -rf "$temp_dir"
+    }
+    
+    trap cleanup EXIT INT TERM
+    
+    # Запускаем оконный менеджер в Xephyr
+    DISPLAY="$xephyr_display" openbox --config-file "$openbox_config" &
+    local wm_pid=$!
+    echo "$wm_pid" > "$window_manager_pid_file"
+    sleep 0.5
+    
+    # Запускаем монитор размера в фоне
+    if [[ "$dynamic_resize" == "true" ]]; then
+        "$resize_script" "$xephyr_display" "$app_id" "$xephyr_pid" "${DEBUG:-0}" &
+        resize_monitor_pid=$!
+        log_message DEBUG "Запущен монитор размера (PID: $resize_monitor_pid)"
+    fi
+    
+    # Запускаем приложение
+    DISPLAY="$xephyr_display" "$REAL_FLATPAK" run "${all_args[@]}"
+    local app_exit_code=$?
+    
+    # Очистка
+    cleanup
+    trap - EXIT INT TERM
+    
+    return $app_exit_code
+}
+
+# ====== КОМАНДЫ УПРАВЛЕНИЯ ======
+
+show_help() {
+    cat << EOF
+Flatpak Xephyr Wrapper v1.1
+
+Этот скрипт заменяет стандартный flatpak и автоматически запускает
+приложения в изолированном X-сервере (Xephyr).
+
+ИСПОЛЬЗОВАНИЕ:
+    flatpak [команда] [опции]
+
+СПЕЦИАЛЬНЫЕ КОМАНДЫ:
+    flatpak xephyr-exclude APP_ID    - Добавить приложение в исключения
+    flatpak xephyr-include APP_ID    - Удалить приложение из исключений
+    flatpak xephyr-list              - Показать список исключений
+    flatpak xephyr-status            - Показать статус и конфигурацию
+    flatpak xephyr-help              - Показать эту справку
+    flatpak xephyr-test APP_ID       - Тестовый запуск с отладкой
+
+ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ:
+    FLATPAK_XEPHYR=false         - Отключить Xephyr для текущего запуска
+    FLATPAK_XEPHYR_RES=WxH       - Установить разрешение (по умолчанию: 1280x720)
+    DEBUG=1                      - Включить отладочные сообщения
+
+ПРИМЕРЫ:
+    flatpak run org.telegram.desktop
+    flatpak run --branch=stable --arch=x86_64 org.gimp.GIMP
+    flatpak run --command=missioncenter io.missioncenter.MissionCenter
+    FLATPAK_XEPHYR=false flatpak run org.gimp.GIMP
+
+ФАЙЛЫ КОНФИГУРАЦИИ:
+    $EXCLUDE_FILE    - Список исключений
+    $LOG_FILE        - Лог файл
+
+EOF
+}
+
+show_status() {
+    echo "=== Flatpak Xephyr Wrapper Status ==="
+    echo ""
+    echo "Конфигурация:"
+    echo "  Xephyr включен: ${XEPHYR_ENABLED}"
+    echo "  Разрешение: ${XEPHYR_RESOLUTION}"
+    echo "  Оригинальный flatpak: ${REAL_FLATPAK}"
+    echo ""
+    
+    if check_xephyr; then
+        echo "  Xephyr: $(which Xephyr) ✓"
+    else
+        echo "  Xephyr: НЕ УСТАНОВЛЕН ✗"
+    fi
+    echo ""
+    
+    echo "Исключенные приложения:"
+    if [[ -f "$EXCLUDE_FILE" ]]; then
+        grep -v "^#" "$EXCLUDE_FILE" | grep -v "^$" | while read -r app; do
+            echo "  - $app"
+        done
+    else
+        echo "  (нет)"
+    fi
+    echo ""
+    
+    echo "Установленные Flatpak приложения:"
+    "$REAL_FLATPAK" list --app --columns=application,name | tail -n +1 | while IFS=$'\t' read -r app name; do
+        if is_excluded "$app"; then
+            echo "  ✗ $app - $name (исключено)"
+        else
+            echo "  ✓ $app - $name"
+        fi
+    done
+}
+
+test_parse_args() {
+    local app_id="$1"
+    shift
+    
+    echo "=== Тестовый запуск парсинга аргументов ==="
+    echo "Тестовая команда: flatpak run $*"
+    echo ""
+    
+    parse_flatpak_run_args "$@"
+    
+    echo "Результаты парсинга:"
+    echo "  APP_ID: $PARSED_APP_ID"
+    echo "  Все аргументы: ${FLATPAK_RUN_ARGS[*]}"
+    echo ""
+    
+    if [[ "$PARSED_APP_ID" != "$app_id" ]]; then
+        echo -e "${RED}ОШИБКА: Ожидалось APP_ID='$app_id', получено='$PARSED_APP_ID'${NC}"
+    else
+        echo -e "${GREEN}✓ APP_ID определен корректно${NC}"
+    fi
+}
+
+# ====== ДОПОЛНИТЕЛЬНЫЕ УТИЛИТЫ (меню, rofi) ======
+
+xephyr_resize_menu() {
+    local app_id="$1"
+    
+    echo "=== Выберите размер окна для $app_id ==="
+    echo "1) 800x600   - Компактный"
+    echo "2) 1024x768  - Стандартный"
+    echo "3) 1280x720  - HD"
+    echo "4) 1366x768  - Ноутбук"
+    echo "5) 1920x1080 - Full HD"
+    echo "6) 2560x1440 - 2K"
+    echo "7) Авто      - Динамическая подстройка"
+    echo "8) Своё      - Ввести вручную"
+    
+    read -p "Выбор (1-8): " choice
+    
+    case "$choice" in
+        1) export XEPHYR_RESOLUTION="800x600"; export XEPHYR_DYNAMIC="false" ;;
+        2) export XEPHYR_RESOLUTION="1024x768"; export XEPHYR_DYNAMIC="false" ;;
+        3) export XEPHYR_RESOLUTION="1280x720"; export XEPHYR_DYNAMIC="false" ;;
+        4) export XEPHYR_RESOLUTION="1366x768"; export XEPHYR_DYNAMIC="false" ;;
+        5) export XEPHYR_RESOLUTION="1920x1080"; export XEPHYR_DYNAMIC="false" ;;
+        6) export XEPHYR_RESOLUTION="2560x1440"; export XEPHYR_DYNAMIC="false" ;;
+        7) export XEPHYR_DYNAMIC="true" ;;
+        8) 
+            read -p "Введите размер (ШИРИНАxВЫСОТА): " custom_res
+            if [[ "$custom_res" =~ ^[0-9]+x[0-9]+$ ]]; then
+                export XEPHYR_RESOLUTION="$custom_res"
+                export XEPHYR_DYNAMIC="false"
+            else
+                echo "Неверный формат!"
+                return 1
+            fi
+            ;;
+        *)
+            echo "Неверный выбор!"
+            return 1
+            ;;
+    esac
+    
+    echo "Установлено: ${XEPHYR_RESOLUTION:-Авто} (динамика: $XEPHYR_DYNAMIC)"
+}
+
+xephyr_launcher_rofi() {
+    if ! command -v rofi &>/dev/null; then
+        echo "Rofi не установлен!"
+        return 1
+    fi
+    
+    # Получаем список приложений
+    local apps=$("$REAL_FLATPAK" list --app --columns=application,name)
+    
+    # Выбор приложения
+    local selected=$(echo "$apps" | rofi -dmenu -p "Flatpak App:" -i)
+    [[ -z "$selected" ]] && return
+    
+    local app_id=$(echo "$selected" | awk '{print $1}')
+    
+    # Выбор режима
+    local mode=$(echo -e "Динамический размер\nФиксированный 1280x720\nФиксированный 1920x1080\nБез Xephyr" | \
+                 rofi -dmenu -p "Режим запуска:")
+    
+    case "$mode" in
+        "Динамический размер")
+            XEPHYR_DYNAMIC=true run_in_xephyr "$app_id"
+            ;;
+        "Фиксированный 1280x720")
+            XEPHYR_RESOLUTION="1280x720" XEPHYR_DYNAMIC=false run_in_xephyr "$app_id"
+            ;;
+        "Фиксированный 1920x1080")
+            XEPHYR_RESOLUTION="1920x1080" XEPHYR_DYNAMIC=false run_in_xephyr "$app_id"
+            ;;
+        "Без Xephyr")
+            "$REAL_FLATPAK" run "$app_id"
+            ;;
+    esac
+}
+
+# ====== ОСНОВНАЯ ЛОГИКА ======
+
+# Инициализация
+init_config
+
+# Находим оригинальный flatpak
+REAL_FLATPAK=$(find_real_flatpak)
+if [[ -z "$REAL_FLATPAK" ]]; then
+    echo -e "${RED}ОШИБКА: Не удалось найти оригинальный flatpak${NC}" >&2
+    echo "Убедитесь, что flatpak установлен в системе" >&2
+    exit 1
+fi
+
+# Обработка специальных команд xephyr-*
+case "${1:-}" in
+    xephyr-help)
+        show_help
+        exit 0
+        ;;
+    xephyr-status)
+        show_status
+        exit 0
+        ;;
+    xephyr-exclude)
+        if [[ -z "${2:-}" ]]; then
+            echo -e "${RED}Ошибка: укажите APP_ID${NC}" >&2
+            exit 1
+        fi
+        echo "$2" >> "$EXCLUDE_FILE"
+        echo -e "${GREEN}✓ Добавлено в исключения: $2${NC}"
+        exit 0
+        ;;
+    xephyr-include)
+        if [[ -z "${2:-}" ]]; then
+            echo -e "${RED}Ошибка: укажите APP_ID${NC}" >&2
+            exit 1
+        fi
+        if [[ -f "$EXCLUDE_FILE" ]]; then
+            sed -i "/^${2}$/d" "$EXCLUDE_FILE"
+            echo -e "${GREEN}✓ Удалено из исключений: $2${NC}"
+        fi
+        exit 0
+        ;;
+    xephyr-list)
+        echo "Исключенные приложения:"
+        if [[ -f "$EXCLUDE_FILE" ]]; then
+            grep -v "^#" "$EXCLUDE_FILE" | grep -v "^$"
+        else
+            echo "  (список пуст)"
+        fi
+        exit 0
+        ;;
+    xephyr-test)
+        shift
+        test_parse_args "$@"
+        exit 0
+        ;;
+esac
+
+# Проверяем, нужно ли использовать Xephyr
+if [[ "${1:-}" == "run" ]] && [[ "$XEPHYR_ENABLED" == "true" ]]; then
+    # Убираем "run" из аргументов
+    shift
+    
+    # Парсим аргументы для получения APP_ID
+    parse_flatpak_run_args "$@"
+    app_id="$PARSED_APP_ID"
+    
+    # Отладочный вывод
+    if [[ "${DEBUG:-0}" == "1" ]]; then
+        echo -e "${BLUE}DEBUG: Обработка flatpak run${NC}"
+        echo -e "${BLUE}DEBUG: Аргументы: $*${NC}"
+        echo -e "${BLUE}DEBUG: APP_ID: $app_id${NC}"
+    fi
+    
+    # Проверяем условия для запуска в Xephyr
+    if [[ -z "$DISPLAY" ]] || \
+       [[ "$DISPLAY" =~ ^:[1-9][0-9]+ ]] || \
+       [[ -z "$app_id" ]] || \
+       is_excluded "$app_id"; then
+        # Запускаем без Xephyr
+        if [[ "${DEBUG:-0}" == "1" ]]; then
+            echo -e "${BLUE}DEBUG: Запуск без Xephyr${NC}"
+            if [[ -z "$DISPLAY" ]]; then
+                echo -e "${BLUE}DEBUG: Причина: DISPLAY не установлен${NC}"
+            elif [[ "$DISPLAY" =~ ^:[1-9][0-9]+ ]]; then
+                echo -e "${BLUE}DEBUG: Причина: Уже в Xephyr (DISPLAY=$DISPLAY)${NC}"
+            elif [[ -z "$app_id" ]]; then
+                echo -e "${BLUE}DEBUG: Причина: APP_ID не определен${NC}"
+            elif is_excluded "$app_id"; then
+                echo -e "${BLUE}DEBUG: Причина: $app_id в списке исключений${NC}"
+            fi
+        fi
+        exec "$REAL_FLATPAK" run "$@"
+    else
+        # Запускаем в Xephyr (динамическая версия)
+        if [[ "${DEBUG:-0}" == "1" ]]; then
+            echo -e "${BLUE}DEBUG: Запуск в Xephyr (динамический)${NC}"
+        fi
+        run_in_xephyr "$@"
+    fi
+else
+    # Все остальные команды передаем оригинальному flatpak
+    exec "$REAL_FLATPAK" "$@"
+fi
