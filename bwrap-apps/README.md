@@ -19,4 +19,5 @@ sudo apt install bubblewrap xserver-xephyr x11-xserver-utils
 4. Скачайте файл `YandexMusic.sh` в папку `~/.local/bwrap-apps` (`nano ~/.local/bwrap-apps/YandexMusic.sh`)
 5. Выдайте права на исполнение для скрипта: `chmod +xxx ~/.local/bwrap-apps/YandexMusic.sh`
 6. Создайте .desktop файл в `/usr/share/applications` (с sudo, на cutefish только тут, даже при использовании патча на фикс) или `~/.local/applications`
-7. Вставьте текст из `yandexmusic.desktop` файла, заменив `/home/user` на папку своего пользователя (`echo "$HOME"`). На cutefish эта енва сама не ставится.
+7. Вставьте текст из `yandexmusic.desktop` файла, заменив `/home/user` на папку своего пользователя.
+8. Замените `HOME="${HOME:-/home/user}"` на папку своего пользователя в `YandexMusic.sh`
