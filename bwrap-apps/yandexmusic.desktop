@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Яндекс Музыка
+Exec="HOME=/home/user $HOME/.local/bwrap-apps/YandexMusic.sh" %U
+Terminal=false
+Type=Application
+Icon=yandexmusic
+StartupWMClass=Яндекс Музыка
+Comment=Персональные рекомендации, подборки на любой случай и музыкальные новинки
+MimeType=x-scheme-handler/yandexmusic;
+Categories=Audio;
