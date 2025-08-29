@@ -15,6 +15,12 @@ EXCLUDE_FILE="$CONFIG_DIR/exclude.conf"
 LOG_FILE="$CONFIG_DIR/xephyr.log"
 SIZES_FILE="$CONFIG_DIR/window-sizes.conf"
 
+CLIPBOARD_MONITOR_ENABLED="${FLATPAK_CLIPBOARD_MONITOR:-true}"
+CLIPBOARD_SECURE_MODE="${FLATPAK_CLIPBOARD_SECURE:-true}"
+CLIPBOARD_SYNC_SCRIPT="$CONFIG_DIR/clipboard-sync.sh"
+CLIPBOARD_PASTE_FIFO="/tmp/.xephyr-paste-fifo-$$"
+COPYQ_INTEGRATION="${FLATPAK_COPYQ:-true}"
+
 # Встроенные исключения
 DEFAULT_EXCLUDES=(
     "org.kde.kdenlive"
@@ -275,6 +281,131 @@ load_window_size() {
     fi
     
     return 1
+}
+
+# ====== ФУНКЦИИ БУФЕРА ОБМЕНА ======
+
+setup_clipboard_monitor() {
+    local xephyr_display="$1"
+    local app_id="$2"
+    
+    # Проверяем наличие CopyQ
+    if ! command -v copyq &>/dev/null; then
+        log_message WARNING "CopyQ не установлен, мониторинг буфера отключен"
+        return 1
+    fi
+    
+    # Создаём скрипт мониторинга буфера
+    cat > "$CLIPBOARD_SYNC_SCRIPT" << 'EOCLIPBOARD'
+#!/bin/bash
+XEPHYR_DISPLAY="$1"
+HOST_DISPLAY="${2:-:0}"
+APP_ID="$3"
+SECURE_MODE="${4:-true}"
+
+# Мониторинг буфера Xephyr -> CopyQ
+monitor_xephyr_clipboard() {
+    local prev_clipboard=""
+    local prev_primary=""
+    
+    while true; do
+        # Clipboard selection
+        current_clipboard=$(DISPLAY="$XEPHYR_DISPLAY" xclip -selection clipboard -o 2>/dev/null)
+        
+        if [[ "$current_clipboard" != "$prev_clipboard" ]] && [[ -n "$current_clipboard" ]]; then
+            # Добавляем в CopyQ с тегом от источника
+            printf '%s' "$current_clipboard" | DISPLAY="$HOST_DISPLAY" copyq write text/plain - application/x-copyq-tags "xephyr-$APP_ID" application/x-copyq-owner "$APP_ID"
+            
+            prev_clipboard="$current_clipboard"
+            
+            # В защищённом режиме очищаем буфер Xephyr после копирования
+            if [[ "$SECURE_MODE" == "true" ]]; then
+                sleep 0.1
+                echo "" | DISPLAY="$XEPHYR_DISPLAY" xclip -selection clipboard -i 2>/dev/null
+            fi
+        fi
+        
+        sleep 0.3
+    done
+}
+
+monitor_xephyr_clipboard
+EOCLIPBOARD
+    
+    chmod +x "$CLIPBOARD_SYNC_SCRIPT"
+    "$CLIPBOARD_SYNC_SCRIPT" "$xephyr_display" "${DISPLAY:-:0}" "$app_id" "$CLIPBOARD_SECURE_MODE" &
+    return $!
+}
+
+setup_clipboard_paste_proxy() {
+    local xephyr_display="$1"
+    local app_id="$2"
+    
+    # Создаём FIFO для команд вставки
+    mkfifo -m 600 "$CLIPBOARD_PASTE_FIFO" 2>/dev/null || true
+    
+    # Скрипт обработки команд вставки
+    cat > "$temp_dir/paste-proxy.sh" << 'EOPASTE'
+#!/bin/bash
+XEPHYR_DISPLAY="$1"
+HOST_DISPLAY="${2:-:0}"
+PASTE_FIFO="$3"
+SECURE_TIMEOUT="${4:-0.5}"
+
+paste_from_copyq() {
+    local index="${1:-0}"
+    local content=$(DISPLAY="$HOST_DISPLAY" copyq read "$index")
+    
+    if [[ -n "$content" ]]; then
+        # Временно помещаем в буфер Xephyr
+        echo "$content" | DISPLAY="$XEPHYR_DISPLAY" xclip -selection clipboard -i
+        
+        # Эмулируем Ctrl+V
+        DISPLAY="$XEPHYR_DISPLAY" xdotool key --clearmodifiers ctrl+v 2>/dev/null || \
+        DISPLAY="$XEPHYR_DISPLAY" xdotool key --clearmodifiers shift+Insert 2>/dev/null
+        
+        # Очищаем буфер через таймаут (защита от чтения)
+        (sleep "$SECURE_TIMEOUT" && echo "" | DISPLAY="$XEPHYR_DISPLAY" xclip -selection clipboard -i) &
+    fi
+}
+
+# Обработка команд
+while true; do
+    if read -r command < "$PASTE_FIFO"; then
+        case "$command" in
+            paste:*) paste_from_copyq "${command#paste:}" ;;
+            clear) echo "" | DISPLAY="$XEPHYR_DISPLAY" xclip -selection clipboard -i ;;
+            *) continue ;;
+        esac
+    fi
+done
+EOPASTE
+    
+    chmod +x "$temp_dir/paste-proxy.sh"
+    "$temp_dir/paste-proxy.sh" "$xephyr_display" "${DISPLAY:-:0}" "$CLIPBOARD_PASTE_FIFO" &
+    return $!
+}
+
+# Горячие клавиши для вставки из CopyQ
+setup_clipboard_hotkeys() {
+    local xephyr_display="$1"
+    
+    # Альтернативный метод через xbindkeys
+    cat > "$temp_dir/xbindkeys-clipboard" << EOF
+"echo 'paste:0' > $CLIPBOARD_PASTE_FIFO"
+    F1
+"echo 'paste:1' > $CLIPBOARD_PASTE_FIFO"
+    F2
+"echo 'paste:2' > $CLIPBOARD_PASTE_FIFO"
+    F3
+EOF
+    
+    if command -v xbindkeys &>/dev/null; then
+        ( DISPLAY="$xephyr_display" xbindkeys -f "$temp_dir/xbindkeys-clipboard" ) &
+        return $!
+    fi
+    
+    return 0
 }
 
 # ====== ДИНАМИЧЕСКАЯ ВЕРСИЯ run_in_xephyr (замена оригинальной) ======
@@ -1038,16 +1169,57 @@ EOSCRIPT
     "$temp_dir/keyboard-sync.sh" &
     keyboard_sync_pid=$!
     log_message DEBUG "Запущена синхронизация клавиатуры (PID: $keyboard_sync_pid)"
+    
+    # Запуск мониторинга буфера обмена
+    local clipboard_monitor_pid=""
+    local paste_proxy_pid=""
+    local hotkeys_pid=""
+    
+    if [[ "$CLIPBOARD_MONITOR_ENABLED" == "true" ]]; then
+        # Запускаем монитор буфера
+        setup_clipboard_monitor "$xephyr_display" "$app_id"
+        clipboard_monitor_pid=$!
+        log_message DEBUG "Запущен монитор буфера (PID: $clipboard_monitor_pid)"
+        
+        # Запускаем прокси для вставки
+        if [[ "$CLIPBOARD_SECURE_MODE" == "true" ]]; then
+            setup_clipboard_paste_proxy "$xephyr_display" "$app_id"
+            paste_proxy_pid=$!
+            log_message DEBUG "Запущен прокси вставки (PID: $paste_proxy_pid)"
+            
+           # Настраиваем горячие клавиши
+           setup_clipboard_hotkeys "$xephyr_display"
+           hotkeys_pid=$!
+           log_message DEBUG "Настроены горячие клавиши буфера (PID: $hotkeys_pid)"
+        fi
+    fi
+
 
     
     # Функция очистки
     cleanup() {
         log_message DEBUG "Очистка процессов и файлов"
-    
-    # Завершаем перехват клавиш
-    if [[ -n "${keyboard_sync_pid:-}" ]]; then
-        kill "$keyboard_sync_pid" 2>/dev/null || true
-    fi
+        
+        # Завершаем процессы буфера обмена
+        if [[ -n "${clipboard_monitor_pid:-}" ]]; then
+            kill "$clipboard_monitor_pid" 2>/dev/null || true
+        fi
+        
+        if [[ -n "${paste_proxy_pid:-}" ]]; then
+            kill "$paste_proxy_pid" 2>/dev/null || true
+        fi
+        
+        if [[ -n "${hotkeys_pid:-}" ]]; then
+            kill "$hotkeys_pid" 2>/dev/null || true
+        fi
+        
+        # Удаляем FIFO
+        rm -f "$CLIPBOARD_PASTE_FIFO" 2>/dev/null || true
+
+        # Завершаем перехват клавиш
+        if [[ -n "${keyboard_sync_pid:-}" ]]; then
+            kill "$keyboard_sync_pid" 2>/dev/null || true
+        fi
         
         # Завершаем монитор размера
         if [[ -n "${resize_monitor_pid:-}" ]]; then
@@ -1140,11 +1312,18 @@ Flatpak Xephyr Wrapper v1.1
     flatpak xephyr-test APP_ID       - Тестовый запуск с отладкой
     flatpak xephyr-sizes             - Посмотреть сохраненные размеры окон
     flatpak xephyr-clear-size        - Очистить сохраненные размеры окон
+    flatpak xephyr-clipboard-status  - Статус интеграции буфера
+    flatpak xephyr-clipboard-test    - Тест работы буфера
+    flatpak xephyr-paste [INDEX]     - Вставить из CopyQ
+
 
 ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ:
-    FLATPAK_XEPHYR=false         - Отключить Xephyr для текущего запуска
-    FLATPAK_XEPHYR_RES=WxH       - Установить разрешение (по умолчанию: 1280x720)
-    DEBUG=1                      - Включить отладочные сообщения
+    FLATPAK_XEPHYR=false             - Отключить Xephyr для текущего запуска
+    FLATPAK_XEPHYR_RES=WxH           - Установить разрешение (по умолчанию: 1280x720)
+    FLATPAK_CLIPBOARD_MONITOR=false  - Отключить мониторинг буфера
+    FLATPAK_CLIPBOARD_SECURE=false   - Отключить защищённый режим
+    FLATPAK_COPYQ=false              - Отключить интеграцию с CopyQ
+    DEBUG=1                          - Включить отладочные сообщения
 
 ПРИМЕРЫ:
     flatpak run org.telegram.desktop
@@ -1376,7 +1555,56 @@ case "${1:-}" in
         fi
         exit 0
         ;;
-
+        
+    xephyr-clipboard-status)
+        echo "=== Статус интеграции буфера обмена ==="
+        echo "Мониторинг: $CLIPBOARD_MONITOR_ENABLED"
+        echo "Безопасный режим: $CLIPBOARD_SECURE_MODE"
+        echo "CopyQ интеграция: $COPYQ_INTEGRATION"
+        
+        if command -v copyq &>/dev/null; then
+            echo "CopyQ: установлен ✓"
+            copyq_items=$(DISPLAY="${DISPLAY:-:0}" copyq size 2>/dev/null || echo "0")
+            echo "Элементов в CopyQ: $copyq_items"
+        else
+            echo "CopyQ: НЕ УСТАНОВЛЕН ✗"
+        fi
+        
+        if command -v xclip &>/dev/null; then
+            echo "xclip: установлен ✓"
+        else
+            echo "xclip: НЕ УСТАНОВЛЕН ✗"
+        fi
+        exit 0
+        ;;
+        
+    xephyr-clipboard-test)
+        echo "Тестирование буфера обмена..."
+        test_text="Test-$(date +%s)"
+        echo "$test_text" | xclip -selection clipboard -i
+        sleep 0.5
+        
+        if command -v copyq &>/dev/null; then
+            last_item=$(copyq read 0)
+            if [[ "$last_item" == "$test_text" ]]; then
+                echo "✓ Интеграция с CopyQ работает"
+            else
+                echo "✗ CopyQ не получил данные"
+            fi
+        fi
+        exit 0
+        ;;
+        
+    xephyr-paste)
+        # Ручная вставка из CopyQ в активное окно
+        if [[ -n "$CLIPBOARD_PASTE_FIFO" ]] && [[ -p "$CLIPBOARD_PASTE_FIFO" ]]; then
+            echo "paste:${2:-0}" > "$CLIPBOARD_PASTE_FIFO"
+            echo "Вставлен элемент ${2:-0} из CopyQ"
+        else
+            echo "Прокси вставки не активен"
+        fi
+        exit 0
+        ;;
 esac
 
 # Проверяем, нужно ли использовать Xephyr
