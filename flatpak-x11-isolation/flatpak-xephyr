@@ -307,21 +307,56 @@ SECURE_MODE="${4:-true}"
 monitor_xephyr_clipboard() {
     local prev_clipboard=""
     local prev_primary=""
+    local prev_image_hash=""
     
     while true; do
-        # Clipboard selection
-        current_clipboard=$(DISPLAY="$XEPHYR_DISPLAY" xclip -selection clipboard -o 2>/dev/null)
+        # === ТЕКСТОВЫЙ БУФЕР ===
+        current_clipboard=$(DISPLAY="$XEPHYR_DISPLAY" xclip -selection clipboard -o -t TARGETS 2>/dev/null)
         
-        if [[ "$current_clipboard" != "$prev_clipboard" ]] && [[ -n "$current_clipboard" ]]; then
-            # Добавляем в CopyQ с тегом от источника
-            printf '%s' "$current_clipboard" | DISPLAY="$HOST_DISPLAY" copyq write text/plain - application/x-copyq-tags "xephyr-$APP_ID" application/x-copyq-owner "$APP_ID"
+        # Проверяем наличие текста
+        if echo "$current_clipboard" | grep -q "UTF8_STRING\|TEXT"; then
+            current_text=$(DISPLAY="$XEPHYR_DISPLAY" xclip -selection clipboard -o 2>/dev/null)
             
-            prev_clipboard="$current_clipboard"
+            if [[ "$current_text" != "$prev_clipboard" ]] && [[ -n "$current_text" ]]; then
+                printf '%s' "$current_text" | DISPLAY="$HOST_DISPLAY" copyq write text/plain - application/x-copyq-tags "xephyr-$APP_ID" application/x-copyq-owner "$APP_ID"
+                
+                prev_clipboard="$current_text"
+                
+            fi
+        fi
+        
+        # === ИЗОБРАЖЕНИЯ ===
+        if echo "$current_clipboard" | grep -q "image/png\|image/jpeg\|image/bmp"; then
+            # Определяем формат изображения
+            image_format=""
+            if echo "$current_clipboard" | grep -q "image/png"; then
+                image_format="image/png"
+            elif echo "$current_clipboard" | grep -q "image/jpeg"; then
+                image_format="image/jpeg"
+            elif echo "$current_clipboard" | grep -q "image/bmp"; then
+                image_format="image/bmp"
+            fi
             
-            # В защищённом режиме очищаем буфер Xephyr после копирования
-            if [[ "$SECURE_MODE" == "true" ]]; then
-                sleep 0.1
-                echo "" | DISPLAY="$XEPHYR_DISPLAY" xclip -selection clipboard -i 2>/dev/null
+            if [[ -n "$image_format" ]]; then
+                # Сохраняем изображение во временный файл
+                temp_image="/tmp/xephyr-clipboard-image-$$.png"
+                
+                # Извлекаем изображение из буфера
+                DISPLAY="$XEPHYR_DISPLAY" xclip -selection clipboard -t "$image_format" -o > "$temp_image" 2>/dev/null
+                
+                if [[ -s "$temp_image" ]]; then
+                    # Вычисляем хэш для проверки изменений
+                    current_image_hash=$(md5sum "$temp_image" | cut -d' ' -f1)
+                    
+                    if [[ "$current_image_hash" != "$prev_image_hash" ]]; then
+                        # Добавляем изображение в CopyQ
+                        DISPLAY="$HOST_DISPLAY" copyq write image/png - application/x-copyq-tags "xephyr-image-$APP_ID" application/x-copyq-owner "$APP_ID" < "$temp_image"
+                        
+                        prev_image_hash="$current_image_hash"
+                    fi
+                fi
+                
+                rm -f "$temp_image" 2>/dev/null
             fi
         fi
         
@@ -354,31 +389,100 @@ SECURE_TIMEOUT="${4:-0.5}"
 
 paste_from_copyq() {
     local index="${1:-0}"
-    local content=$(DISPLAY="$HOST_DISPLAY" copyq read "$index")
     
-    if [[ -n "$content" ]]; then
-        # Временно помещаем в буфер Xephyr
-        echo "$content" | DISPLAY="$XEPHYR_DISPLAY" xclip -selection clipboard -i
+    # Проверяем, есть ли изображение в указанной позиции
+    # CopyQ хранит MIME типы через табуляцию
+    local item_data=$(DISPLAY="$HOST_DISPLAY" copyq eval "
+        var data = getItem($index);
+        var mimes = [];
+        for (var mime in data) {
+            mimes.push(mime);
+        }
+        mimes.join('\t');
+    " 2>/dev/null)
+    
+    # Проверка на изображение
+    if echo "$mime_types" | grep -q "image/"; then
+        paste_image_from_copyq "$index"
+    else
+        # Текстовая вставка (существующий код)
+        local content=$(DISPLAY="$HOST_DISPLAY" copyq read "$index")
         
-        # Эмулируем Ctrl+V
-        DISPLAY="$XEPHYR_DISPLAY" xdotool key --clearmodifiers ctrl+v 2>/dev/null || \
-        DISPLAY="$XEPHYR_DISPLAY" xdotool key --clearmodifiers shift+Insert 2>/dev/null
-        
-        # Очищаем буфер через таймаут (защита от чтения)
-        (sleep "$SECURE_TIMEOUT" && echo "" | DISPLAY="$XEPHYR_DISPLAY" xclip -selection clipboard -i) &
+        if [[ -n "$content" ]]; then
+            echo "$content" | DISPLAY="$XEPHYR_DISPLAY" xclip -selection clipboard -i
+            
+            DISPLAY="$XEPHYR_DISPLAY" xdotool key --clearmodifiers ctrl+v 2>/dev/null || \
+            DISPLAY="$XEPHYR_DISPLAY" xdotool key --clearmodifiers shift+Insert 2>/dev/null
+            
+            (sleep "$SECURE_TIMEOUT" && echo "" | DISPLAY="$XEPHYR_DISPLAY" xclip -selection clipboard -i) &
+        fi
     fi
 }
 
-# Обработка команд
+paste_image_from_copyq() {
+    local index="${1:-0}"
+    local temp_image="/tmp/copyq-paste-image-$$.png"
+    
+    # Извлекаем изображение из CopyQ
+    if DISPLAY="$HOST_DISPLAY" copyq eval "
+            var data = getItem($index);
+            if (data['image/png']) {
+                print(toBase64(data['image/png']));
+            } else if (data['image/jpeg']) {
+                print(toBase64(data['image/jpeg']));
+            } else if (data['image/bmp']) {
+                print(toBase64(data['image/bmp']));
+            }
+        " | base64 -d > "$temp_image" 2>/dev/null 2>/dev/null; then
+        if [[ -s "$temp_image" ]]; then
+            # Помещаем изображение в буфер Xephyr
+            DISPLAY="$XEPHYR_DISPLAY" xclip -selection clipboard -t image/png -i < "$temp_image"
+            
+            # Пытаемся вставить через Ctrl+V
+            DISPLAY="$XEPHYR_DISPLAY" xdotool key --clearmodifiers ctrl+v 2>/dev/null
+            
+            # В защищённом режиме очищаем через таймаут
+            if [[ "$SECURE_MODE" == "true" ]]; then
+                (sleep "$SECURE_TIMEOUT" && echo "" | DISPLAY="$XEPHYR_DISPLAY" xclip -selection clipboard -i) &
+            fi
+        fi
+    fi
+    
+    rm -f "$temp_image" 2>/dev/null
+}
+
+# Функция для создания скриншота окна Xephyr
+capture_xephyr_screenshot() {
+    local temp_screenshot="/tmp/xephyr-screenshot-$$.png"
+    
+    # Делаем скриншот всего Xephyr дисплея
+    DISPLAY="$XEPHYR_DISPLAY" import -window root "$temp_screenshot" 2>/dev/null || \
+    DISPLAY="$XEPHYR_DISPLAY" scrot "$temp_screenshot" 2>/dev/null
+    
+    if [[ -s "$temp_screenshot" ]]; then
+        # Копируем в буфер хоста и CopyQ
+        DISPLAY="$HOST_DISPLAY" xclip -selection clipboard -t image/png -i < "$temp_screenshot"
+        #DISPLAY="$HOST_DISPLAY" copyq write image/png - < "$temp_screenshot"
+        #DISPLAY="$HOST_DISPLAY" copyq write 0 \
+        #    application/x-copyq-tags "xephyr-screenshot-$APP_ID"
+    fi
+    
+    rm -f "$temp_screenshot" 2>/dev/null
+}
+
+# Добавьте новую команду в case обработки команд
 while true; do
     if read -r command < "$PASTE_FIFO"; then
         case "$command" in
             paste:*) paste_from_copyq "${command#paste:}" ;;
+            paste-image:*) paste_image_from_copyq "${command#paste-image:}" ;;
+            copy-screenshot) capture_xephyr_screenshot ;;
             clear) echo "" | DISPLAY="$XEPHYR_DISPLAY" xclip -selection clipboard -i ;;
             *) continue ;;
         esac
     fi
 done
+
 EOPASTE
     
     chmod +x "$temp_dir/paste-proxy.sh"
@@ -398,6 +502,14 @@ setup_clipboard_hotkeys() {
     F2
 "echo 'paste:2' > $CLIPBOARD_PASTE_FIFO"
     F3
+"echo 'paste-image:0' > $CLIPBOARD_PASTE_FIFO"
+    shift+F1
+"echo 'paste-image:1' > $CLIPBOARD_PASTE_FIFO"
+    shift+F2
+"echo 'copy-screenshot' > $CLIPBOARD_PASTE_FIFO"
+    Print
+"echo 'copy-screenshot' > $CLIPBOARD_PASTE_FIFO"
+    shift+F12
 EOF
     
     if command -v xbindkeys &>/dev/null; then
@@ -424,7 +536,7 @@ run_in_xephyr() {
     
     # Проверяем зависимости (включая Xephyr)
     local missing_deps=()
-    for cmd in Xephyr openbox xdotool wmctrl xrandr; do
+    for cmd in Xephyr openbox xdotool wmctrl xrandr xclip; do
         if ! command -v "$cmd" &>/dev/null; then
             missing_deps+=("$cmd")
         fi
@@ -433,8 +545,22 @@ run_in_xephyr() {
     if [[ ${#missing_deps[@]} -gt 0 ]]; then
         log_message WARNING "Отсутствуют зависимости: ${missing_deps[*]}"
         echo -e "${YELLOW}Для динамического размера установите:${NC}"
-        echo "  sudo apt install xserver-xephyr openbox xdotool wmctrl x11-xserver-utils"
+        echo "  sudo apt install xserver-xephyr openbox xdotool wmctrl x11-xserver-utils xclip"
         exec "$REAL_FLATPAK" run "$@"
+    fi
+    
+    # Опциональные зависимости для изображений
+    local optional_deps=()
+    for cmd in import scrot convert; do
+        if ! command -v "$cmd" &>/dev/null; then
+            optional_deps+=("$cmd")
+        fi
+    done
+    
+    if [[ ${#optional_deps[@]} -gt 0 ]]; then
+        log_message WARNING "Для полной поддержки изображений установите: ${optional_deps[*]}"
+        echo -e "${YELLOW}Рекомендуется установить:${NC}"
+        echo "  sudo apt install imagemagick scrot"
     fi
     
     # Настройки
@@ -1315,6 +1441,8 @@ Flatpak Xephyr Wrapper v1.1
     flatpak xephyr-clipboard-status  - Статус интеграции буфера
     flatpak xephyr-clipboard-test    - Тест работы буфера
     flatpak xephyr-paste [INDEX]     - Вставить из CopyQ
+    flatpak xephyr-screenshot NUM    - Скриншот Xephyr дисплея
+    flatpak xephyr-clipboard-formats - Показать форматы буфера
 
 
 ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ:
@@ -1605,6 +1733,59 @@ case "${1:-}" in
         fi
         exit 0
         ;;
+
+    xephyr-screenshot)
+        # Создание скриншота активного Xephyr
+        if [[ -z "${2:-}" ]]; then
+            echo "Использование: flatpak xephyr-screenshot DISPLAY_NUM [APP_ID]"
+            exit 1
+        fi
+        
+        display_num="$2"
+        app_id="${3:-screenshot}"
+        temp_file="/tmp/xephyr-screenshot-$(date +%s).png"
+        
+        DISPLAY=":$display_num" import -window root "$temp_file" 2>/dev/null || \
+        DISPLAY=":$display_num" scrot "$temp_file" 2>/dev/null
+        
+        if [[ -s "$temp_file" ]]; then
+            # Копируем в CopyQ
+            copyq write image/png - application/x-copyq-tags "xephyr-screenshot-$app_id" application/x-copyq-owner "$app_id" < "$temp_image"
+            echo "✓ Скриншот сохранён в CopyQ"
+            
+            # Опционально сохраняем файл
+            if [[ "${SAVE_SCREENSHOT:-false}" == "true" ]]; then
+                cp "$temp_file" "$HOME/Pictures/xephyr-$app_id-$(date +%Y%m%d-%H%M%S).png"
+                echo "✓ Файл сохранён в ~/Pictures/"
+            fi
+        else
+            echo "✗ Не удалось создать скриншот"
+        fi
+        
+        rm -f "$temp_file"
+        exit 0
+        ;;
+        
+    xephyr-clipboard-formats)
+        # Показать поддерживаемые форматы буфера
+        echo "=== Поддерживаемые форматы буфера ==="
+        echo "Текст:"
+        echo "  - UTF8_STRING"
+        echo "  - TEXT"
+        echo "  - STRING"
+        echo ""
+        echo "Изображения:"
+        echo "  - image/png"
+        echo "  - image/jpeg"
+        echo "  - image/bmp"
+        echo ""
+        echo "Горячие клавиши:"
+        echo "  F1-F3         - Вставить текст из CopyQ (позиции 0-2)"
+        echo "  Shift+F1-F2   - Вставить изображение из CopyQ"
+        echo "  Print/Shift+F12 - Скриншот окна Xephyr"
+        exit 0
+        ;;
+
 esac
 
 # Проверяем, нужно ли использовать Xephyr
