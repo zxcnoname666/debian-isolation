@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # === Конфигурация ===
-HOME="${HOME:-/home/user}"
+HOME="${HOME:-/home/loli}"
 APP_NAME="YandexMusic"
 APP_DIR="$HOME/.local/bwrap-apps/YandexMusic"
 APP_EXEC="/opt/Яндекс Музыка/yandexmusic"
@@ -165,6 +165,7 @@ echo -e "${GREEN}🚀 Запуск приложения в изолирован�
 APP_CONFIG_DIR="$HOME/.config/bwrap-$APP_NAME"
 APP_CACHE_DIR="$HOME/.cache/bwrap-$APP_NAME"
 mkdir -p "$APP_CONFIG_DIR" "$APP_CACHE_DIR"
+mkdir -p /tmp/fake-proc-net
 
 # Запуск приложения в bwrap
 bwrap \
@@ -180,6 +181,7 @@ bwrap \
     --ro-bind-try /etc/pulse /etc/pulse \
     --ro-bind-try /etc/alsa /etc/alsa \
     --ro-bind-try /etc/asound.conf /etc/asound.conf \
+    --bind /tmp/fake-proc-net /proc/net \
     --dir /tmp \
     --dir /var \
     --dir /run \
