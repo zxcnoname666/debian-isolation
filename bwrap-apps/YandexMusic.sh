@@ -182,6 +182,7 @@ bwrap \
     --ro-bind-try /etc/alsa /etc/alsa \
     --ro-bind-try /etc/asound.conf /etc/asound.conf \
     --bind /tmp/fake-proc-net /proc/net \
+    --bind /tmp/fake-proc-net /sys/class/net \
     --dir /tmp \
     --dir /var \
     --dir /run \
