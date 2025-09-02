@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # === Конфигурация ===
-HOME="${HOME:-/home/loli}"
+HOME="${HOME:-/home/user}"
 APP_NAME="YandexMusic"
 APP_DIR="$HOME/.local/bwrap-apps/YandexMusic"
 APP_EXEC="/opt/Яндекс Музыка/yandexmusic"
