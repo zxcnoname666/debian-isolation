@@ -1,0 +1,89 @@
+name: 'dev'
+
+services:
+  devbox:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: debian
+    hostname: devbox
+    privileged: true
+    #network_mode: host
+    stdin_open: true  # -i
+    tty: true         # -t
+    
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
+    security_opt:
+      - seccomp:unconfined
+      - apparmor:unconfined
+    
+    ports:
+      - "8080:8080"
+      - "3000:3000"
+    
+    # Сеть
+    networks:
+      - devbox-net
+    
+    environment:
+      - DISPLAY=${DISPLAY}
+      - WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}
+      - ENABLE_PODMAN=true
+      # Опционально для rootless podman
+      - XDG_RUNTIME_DIR=/run/user/1000
+    
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY:-wayland-0}:${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY:-wayland-0}:rw
+      - /dev/dri:/dev/dri
+      
+      - ./workspace:/home/dev/projects:rw
+      - ./tmp-shared:/tmp-shared
+      
+      - ./backup/.ssh:/home/dev/.ssh
+      - ./backup:/home/dev/configs
+      
+      - podman-storage:/var/lib/containers
+      - jetbrains-data:/home/dev/.local/share/JetBrains/Toolbox
+      
+      - all-etc:/etc
+      - all-var:/var
+      - all-root:/root
+      - all-home:/home
+      - all-usr:/usr
+
+    # tmpfs для кэша
+    #tmpfs:
+    #  - /root/.cache:size=4G
+      
+    # Ресурсы
+    deploy:
+      resources:
+        limits:
+          cpus: '10'
+          memory: 24G
+        reservations:
+          cpus: '6'
+          memory: 16G
+
+    command: bash -c "/init.sh" && sudo -E -u dev "/init.sh"
+      
+volumes:
+  podman-storage:
+  jetbrains-data:
+  all-etc:
+  all-var:
+  all-root:
+  all-home:
+  all-usr:
+
+networks:
+  devbox-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+          gateway: 172.28.0.1
+          

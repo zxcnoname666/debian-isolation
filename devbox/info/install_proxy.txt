@@ -1,0 +1,68 @@
+# Установка глобальных прокси для аппов, которые под прокси не хотят
+
+## Качаем redsocks + iptables
+sudo apt install -y redsocks iptables iptables-persistent
+
+## Меняет конфиги redsocks (пример)
+sudo nano /etc/redsocks.conf
+>>
+base {
+        log_debug = off;
+        log_info = off;
+        log = "file:/dev/null";
+        daemon = on;
+        user = redsocks;
+        group = redsocks;
+        redirector = iptables;
+}
+
+redsocks {
+        local_ip = 127.0.0.1;
+        local_port = 3334;
+
+        ip = 127.0.0.0;
+        port = 3128;
+
+
+        type = http-connect;
+
+        login = "";
+        password = "";
+}
+
+
+## Если само не создало, создаем юзера
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin redsocks
+
+## В /root/init.sh добавляем:
+/usr/sbin/redsocks -c /etc/redsocks.conf
+
+## Правила iptables:
+sudo nano /iptables-redsocks.sh
+>>>
+# создаём цепочку
+sudo iptables -t nat -N REDSOCKS
+
+# исключаем локальные и приватные диапазоны (не редиректим их)
+sudo iptables -t nat -A REDSOCKS -d 127.0.0.0/8 -j RETURN
+sudo iptables -t nat -A REDSOCKS -d 10.0.0.0/8 -j RETURN
+sudo iptables -t nat -A REDSOCKS -d 172.16.0.0/12 -j RETURN
+sudo iptables -t nat -A REDSOCKS -d 192.168.0.0/16 -j RETURN
+sudo iptables -t nat -A REDSOCKS -d 224.0.0.0/4 -j RETURN
+sudo iptables -t nat -A REDSOCKS -d 169.254.0.0/16 -j RETURN
+
+# исключаем трафик самого процесса redsocks (по UID)
+sudo iptables -t nat -A REDSOCKS -m owner --uid-owner $(id -u redsocks) -j RETURN
+
+# редиректим оставшийся TCP на локальный порт redsocks (3334)
+sudo iptables -t nat -A REDSOCKS -p tcp -j REDIRECT --to-ports 3334
+
+# применяем цепочку ко всем исходящим пакетам
+sudo iptables -t nat -A OUTPUT -p tcp -j REDSOCKS
+
+
+
+## При надобности можно добавить выполнение этого скрипта в /root/init.sh
+
+
+--- Готово ---

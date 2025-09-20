@@ -1,0 +1,39 @@
+{
+  "version": "1",
+  "autostart": false,
+  "install_location": "/home/dev/.local/share/JetBrains/Toolbox",
+  "tools_location": "/home/dev/.local/share/JetBrains/Toolbox/apps",
+  "scripts_location": "/home/dev/.local/share/JetBrains/Toolbox/scripts",
+  "shell_scripts": {
+    "enabled": true,
+    "location": "/home/dev/.local/share/JetBrains/Toolbox/scripts"
+  },
+  "privacy": {
+    "send_anonymous_usage_statistics": false
+  },
+  "update": {
+    "check_for_updates": true,
+    "update_channel": "release"
+  },
+  "proxy": {
+    "type": "no_proxy"
+  },
+  "appearance": {
+    "theme": "dark",
+    "show_system_tray": false,
+    "close_to_tray": false
+  },
+  "tools": {
+    "clion": {
+      "install_location": "/home/dev/.local/share/JetBrains/Toolbox/apps/clion",
+      "channel": "release"
+    },
+    "rustrover": {
+      "install_location": "/home/dev/.local/share/JetBrains/Toolbox/apps/rustrover",
+      "channel": "release"
+    }
+  },
+  "login": {
+    "auto_login": false
+  }
+}

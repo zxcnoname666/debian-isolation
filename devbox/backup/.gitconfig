@@ -1,0 +1,6 @@
+[commit]
+	gpgsign = false
+[gpg]
+	program = /home/dev/.gpg-smart-helper.sh
+[core]
+	askpass = 

@@ -1,0 +1,45 @@
+# Установка прокси через cloudflare workers
+## Система сложная, зато быстрая и бесплатная:
+## app -> mitmproxy -> cloudflare worker -> dst domain
+
+## 0. Создаем cloudflare worker
+## Вставляем туда код из mitm_cloudflare_worker.js
+
+## 1. Качаем mitmproxy
+## Берем ссылку на скачивание с офф сайта: https://mitmproxy.org
+curl -L "https://downloads.mitmproxy.org/12.1.2/mitmproxy-12.1.2-linux-x86_64.tar.gz" | sudo tar -C /usr/local/bin -xzf -
+
+## 2. Создаем файл-реврайтер
+```
+# url_rewriter.py
+# лежит в этой папке как mitm_url_rewritter.py
+# в PROXY_HOST указываете домен воркера
+```
+
+# 3. Копируем tls сертификаты mitm (запустите mitmproxy, чтобы появилась папка)
+sudo cp ~/.mitmproxy/mitmproxy-ca-cert.pem /usr/local/share/ca-certificates/mitmproxy.crt
+sudo update-ca-certificates
+
+
+# 4. Запускаем
+# mitmdump -s url_rewriter.py --mode transparent # - для iptables
+mitmdump -s url_rewriter.py --listen-port 8080 --set stream_large_bodies=10m --set keep_host_header=true
+
+
+# 5. Устанавливаем прокси в системе по желанию
+echo '
+# Proxy settings
+export http_proxy="http://127.0.0.1:8080"
+export https_proxy="http://127.0.0.1:8080"
+export ftp_proxy="http://127.0.0.1:8080"
+export no_proxy="localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8"
+
+# Uppercase versions for some applications
+export HTTP_PROXY="$http_proxy"
+export HTTPS_PROXY="$https_proxy"
+export FTP_PROXY="$ftp_proxy"
+export NO_PROXY="$no_proxy"
+' >> ~/.bashrc
+
+# Применить изменения
+source ~/.bashrc

@@ -1,0 +1,3 @@
+download.jetbrains.com
+download-cdn.jetbrains.com
+*.jetbrains.com
